@@ -1,0 +1,6 @@
+.env
+/node_modules
+/vendor
+api_kino
+main.exe
+api-kino.rar
