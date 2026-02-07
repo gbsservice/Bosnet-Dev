@@ -4,6 +4,7 @@ import (
 	"api_kino/app/controllers/auth"
 	"api_kino/app/jobs"
 	"api_kino/app/provider"
+	"api_kino/config/constant"
 	"api_kino/service/web"
 	"fmt"
 	"log"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/driver/sqlserver"
+	"gorm.io/gorm"
 )
 
 type Detail struct {
@@ -75,6 +78,88 @@ type CustomData struct {
 
 type GetRequest struct {
 	ClientID string `form:"client_id" json:"client_id"`
+}
+
+/*====================function PushDeliveryOrder=====================*/
+
+type MasterDraftSO struct {
+	KodeNota      string    `json:"kodeNota"`
+	Tgl           time.Time `json:"tgl"`
+	DeliveryDate  time.Time `json:"deliveryDate"`
+	Cust          string    `json:"cust"`
+	SellTo        string    `json:"sellTo"`
+	Sales         string    `json:"sales"`
+	MataUang      string    `json:"mataUang"`
+	Total         float64   `json:"total"`
+	PPn           float64   `json:"ppn"`
+	PaymentMethod string    `json:"paymentMethod"`
+	LamaKredit    string    `json:"lamaKredit"`
+	NoPol         string    `json:"noPol"`
+	GudangDMS     string    `json:"gudangDMS"`
+	CreateDate    time.Time `json:"createDate"`
+	CreateBy      string    `json:"createBy"`
+	Dibatalkan    *bool     `json:"dibatalkan"`
+	Closed        bool      `json:"closed"`
+}
+
+type DetailDraftSO struct {
+	KodeNota     string
+	NoItem       int
+	Brg          string
+	Jml          float64
+	SatuanXls    string
+	HrgSatuan    float64
+	SubTotal     float64
+	Disc         float64
+	DiscPPN      float64
+	HrgSatuanPPN float64 `json:"hrgSatuanPPN"`
+	SubTotalPPn  float64 `json:"subTotalPPn"`
+}
+
+type DOItem struct {
+	ShItemNumber      int     `json:"shItemNumber"`
+	SzProductId       string  `json:"szProductId"`
+	DecQty            float64 `json:"decQty"`
+	DecPrice          float64 `json:"decPrice"`
+	DecAmount         float64 `json:"decAmount"`
+	SzOrderItemTypeId string  `json:"szOrderItemTypeId"`
+}
+
+type DOHeader struct {
+	SzDOId          string  `json:"szDOId"`
+	DtmDelivery     string  `json:"dtmDelivery"`
+	SzFSOId         string  `json:"szFSOId"`
+	SzOrderTypeId   string  `json:"szOrderTypeId"`
+	SzCustId        string  `json:"szCustId"`
+	DecAmount       float64 `json:"decAmount"`
+	DecTax          float64 `json:"decTax"`
+	SzCcyId         string  `json:"szCcyId"`
+	SzVehicleId     string  `json:"szVehicleId"`
+	SzSalesId       string  `json:"szSalesId"`
+	SzWarehouseId   string  `json:"szWarehouseId"`
+	BCash           string  `json:"bCash"`
+	SzPaymentTermId string  `json:"szPaymentTermId"`
+}
+
+type DeliveryOrderPayload struct {
+	SzAppId  string   `json:"szAppId"`
+	FDOData  DOHeader `json:"fdoData"`
+	ItemList []DOItem `json:"itemList"`
+}
+
+type PushDORequest struct {
+	Token    string `json:"token" binding:"required"`
+	FromDate string `json:"fromDate"`
+	ToDate   string `json:"toDate"`
+}
+
+/*=======================================================*/
+
+type Response struct {
+	Status      int         `json:"status"`
+	ProcessTime float64     `json:"processTime"`
+	Message     string      `json:"message"`
+	Data        interface{} `json:"data"`
 }
 
 func main() {
@@ -405,6 +490,247 @@ func PostDraftSOManual(c *gin.Context) {
 
 	web.Response(c, http.StatusOK, web.H{
 		Data: result,
+	})
+}
+
+func chunkStringSlice(slice []string, size int) [][]string {
+	var chunks [][]string
+	for size < len(slice) {
+		slice, chunks = slice[size:], append(chunks, slice[0:size])
+	}
+	chunks = append(chunks, slice)
+	return chunks
+}
+
+func GetDraftSO(db *gorm.DB, fromDate, toDate string) ([]MasterDraftSO, error) {
+	var data []MasterDraftSO
+
+	query := `
+		SELECT
+			KodeNota,
+			Tgl,
+			DeliveryDate,
+			Cust,
+			SellTo,
+			Sales,
+			MataUang,
+			Total,
+			PPn,
+			PaymentMethod,
+			LamaKredit,
+			NoPol,
+			GudangDMS,
+			CreateDate,
+			CreateBy,
+			Dibatalkan,
+			Closed
+		FROM MasterDraftSO
+		WHERE ISNULL(Dibatalkan,0) = 0
+		  AND ISNULL(Closed,0) = 0
+	`
+
+	var args []interface{}
+
+	if fromDate != "" {
+		query += " AND DeliveryDate >= ?"
+		args = append(args, fromDate)
+	}
+
+	if toDate != "" {
+		query += " AND DeliveryDate <= ?"
+		args = append(args, toDate)
+	}
+
+	err := db.Raw(query, args...).Scan(&data).Error
+	return data, err
+}
+
+func GetDraftSOItemsBulk(db *gorm.DB, kodeNotas []string) ([]DetailDraftSO, error) {
+	var allItems []DetailDraftSO
+	chunks := chunkStringSlice(kodeNotas, 500)
+
+	for _, batch := range chunks {
+		var items []DetailDraftSO
+		err := db.Raw(`
+			SELECT
+				KodeNota,
+				NoItem,
+				Brg,
+				Jml,
+				JmlBonus,
+				HrgSatuanPPN,
+				SubTotalPPn
+			FROM DetailDraftSO
+			WHERE KodeNota IN ?
+		`, batch).Scan(&items).Error
+
+		if err != nil {
+			return nil, err
+		}
+		allItems = append(allItems, items...)
+	}
+	return allItems, nil
+}
+
+func BuildPayloads(masters []MasterDraftSO, items []DetailDraftSO) []DeliveryOrderPayload {
+
+	itemMap := make(map[string][]DetailDraftSO)
+	for _, it := range items {
+		itemMap[it.KodeNota] = append(itemMap[it.KodeNota], it)
+	}
+
+	var payloads []DeliveryOrderPayload
+
+	for _, m := range masters {
+		var doItems []DOItem
+		for _, it := range itemMap[m.KodeNota] {
+			doItems = append(doItems, DOItem{
+				ShItemNumber:      it.NoItem,
+				SzProductId:       it.Brg,
+				DecQty:            it.Jml,
+				DecPrice:          it.HrgSatuanPPN,
+				DecAmount:         it.SubTotalPPn,
+				SzOrderItemTypeId: "JUAL",
+			})
+		}
+
+		payloads = append(payloads, DeliveryOrderPayload{
+			SzAppId: "BDI.FORISA",
+			FDOData: DOHeader{
+				SzDOId:          m.KodeNota,
+				DtmDelivery:     m.DeliveryDate.Format(time.RFC3339),
+				SzFSOId:         m.KodeNota,
+				SzOrderTypeId:   "JUAL",
+				SzCustId:        m.Cust,
+				DecAmount:       m.Total,
+				DecTax:          m.PPn,
+				SzCcyId:         m.MataUang,
+				SzVehicleId:     m.NoPol,
+				SzSalesId:       m.Sales,
+				SzWarehouseId:   m.GudangDMS,
+				BCash:           m.PaymentMethod,
+				SzPaymentTermId: m.LamaKredit,
+			},
+			ItemList: doItems,
+		})
+	}
+	return payloads
+}
+
+func PushDeliveryOrder(c *gin.Context) {
+	startTime := time.Now()
+	c.Set(constant.RequestTime, startTime)
+
+	dsn := "sqlserver://api@altius-erp.com:api@altius-erp.com$20240704@36.92.71.147/GSS?database=AltiusDashboard&encrypt=disable"
+
+	db, err := gorm.Open(sqlserver.Open(dsn), &gorm.Config{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Status:  500,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+
+	var req PushDORequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, Response{
+			Status:      400,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     err.Error(),
+			Data:        nil,
+		})
+	}
+
+	if req.Token != "9991caa73ad87eb93f45b99ab987dabcd" {
+		c.JSON(401, Response{
+			Status:      401,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     "Invalid token",
+			Data:        nil,
+		})
+	}
+
+	if req.FromDate == "" || req.ToDate == "" {
+		c.JSON(400, Response{
+			Status:  400,
+			Message: "fill mandatory",
+			Data:    nil,
+		})
+		return
+	}
+
+	fromDate, err := time.Parse("2006-01-02", req.FromDate)
+	if err != nil {
+		c.JSON(400, Response{
+			Status:      400,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     "Invalid fromDate format (YYYY-MM-DD)",
+			Data:        nil,
+		})
+	}
+
+	toDate, err := time.Parse("2006-01-02", req.ToDate)
+	if err != nil {
+		c.JSON(400, Response{
+			Status:      400,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     "Invalid fromDate format (YYYY-MM-DD)",
+			Data:        nil,
+		})
+	}
+
+	if toDate.Before(fromDate) {
+		c.JSON(400, Response{
+			Status:  400,
+			Message: "toDate must be greater or equal to fromDate",
+			Data:    nil,
+		})
+		return
+	}
+
+	masters, err := GetDraftSO(db, req.FromDate, req.ToDate)
+	if err != nil {
+		c.JSON(500, Response{
+			Status:      500,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     err.Error(),
+			Data:        nil,
+		})
+	}
+
+	if len(masters) == 0 {
+		c.JSON(200, Response{
+			Status:      200,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     "No Data",
+			Data:        nil,
+		})
+		return
+	}
+
+	kodeNotas := make([]string, 0, len(masters))
+	for _, m := range masters {
+		kodeNotas = append(kodeNotas, m.KodeNota)
+	}
+
+	items, err := GetDraftSOItemsBulk(db, kodeNotas)
+	if err != nil {
+		c.JSON(500, Response{
+			Status:      500,
+			ProcessTime: float64(time.Since(startTime).Milliseconds()),
+			Message:     err.Error(),
+			Data:        nil,
+		})
+	}
+
+	payloads := BuildPayloads(masters, items)
+
+	c.JSON(200, Response{
+		Status:  200,
+		Message: "success",
+		Data:    payloads,
 	})
 }
 
